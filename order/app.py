@@ -11,11 +11,17 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+# TODO: right now we have saga compensation + tx idempotent payment -> rebuild and run to verify saga is being used with the order service + do failure test to ensure compensation works
+# TODO 2: incorporate add_tx and subtract_tx to the stock so stock operations become idempotent too
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
+TX_MODE = os.getenv("TX_MODE", "SAGA").upper()
+if TX_MODE not in ("SAGA", "2PC"):
+    raise ValueError(f"Invalid TX_MODE={TX_MODE}. Use SAGA or 2PC.")
+app.logger.info(f"Transaction mode: {TX_MODE}")
 
 app = Flask("order-service")
 
@@ -148,6 +154,58 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
+    if TX_MODE == "SAGA":
+        return checkout_saga(order_id)
+    else:  # "2PC"
+        return checkout_baseline(order_id)
+
+def checkout_saga(order_id: str):
+    app.logger.debug(f"[SAGA] Checking out {order_id}")
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # If already paid, make checkout idempotent at order level too
+    if order_entry.paid:
+        return Response("Already paid (idempotent)", status=200)
+
+    # Group quantities per item
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+
+    tx_id = str(uuid.uuid4())
+    app.logger.info(f"[SAGA] order_id={order_id} tx_id={tx_id}")
+
+    # 1) Pay first (so we can compensate if stock fails)
+    pay_reply = send_post_request(
+        f"{GATEWAY_URL}/payment/pay_tx/{tx_id}/{order_entry.user_id}/{order_entry.total_cost}"
+    )
+    if pay_reply.status_code != 200:
+        abort(400, "Payment failed")
+
+    removed_items: list[tuple[str, int]] = []
+
+    # 2) Subtract stock
+    for item_id, quantity in items_quantities.items():
+        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        if stock_reply.status_code != 200:
+            # 3) Compensation: undo any stock removed + refund payment
+            rollback_stock(removed_items)
+            send_post_request(f"{GATEWAY_URL}/payment/refund_tx/{tx_id}")
+            abort(400, f"Out of stock on item_id: {item_id}")
+
+        removed_items.append((item_id, quantity))
+
+    # 4) Mark order paid (final step)
+    order_entry.paid = True
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    return Response("Checkout successful (SAGA)", status=200)
+
+
+def checkout_baseline(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
