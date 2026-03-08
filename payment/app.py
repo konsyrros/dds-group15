@@ -9,7 +9,8 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
-
+WAL_STREAM = "wal:payment"
+WAL_ENTRY_PREFIX = "wal:entry:"
 
 app = Flask("payment-service")
 
@@ -18,10 +19,8 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
-
 def close_db_connection():
     db.close()
-
 
 atexit.register(close_db_connection)
 
@@ -29,20 +28,188 @@ atexit.register(close_db_connection)
 class UserValue(Struct):
     credit: int
 
+# stores 2PC prepare stuff so this are saved in redis and commit can read even if reset between prepare/commit
+class PrepareRecord(Struct):
+    user_id: str
+    amount: int
 
-def get_user_from_db(user_id: str) -> UserValue | None:
+#this is for 2PC lock release due to 
+_RELEASE_LOCK_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+def get_user_from_db(user_id: str) -> UserValue:
     try:
         # get serialized data
         entry: bytes = db.get(user_id)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+    entry = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
         # if user does not exist in the database; abort
         abort(400, f"User: {user_id} not found!")
     return entry
 
+
+# Write Ahead log as seen in the html file so before mutation on data, you record it as pending. afterwards make it done. If crash-restart replay 
+
+def wal_append(op: str, ref_id: str, user_id: str = "", amount: int = 0) -> str:
+    eid = str(uuid.uuid4())
+    pipe = db.pipeline(transaction=True)
+    pipe.hset(f"{WAL_ENTRY_PREFIX}{eid}", mapping={
+        "op": op,
+        "user_id": user_id,
+        "amount": str(amount),
+        "ref_id": ref_id,
+        "status": "pending",
+    })
+    pipe.xadd(WAL_STREAM, {"eid": eid})
+    pipe.execute()
+    return eid
+
+# this just makes it from pending to done
+def wal_done(eid: str):
+    db.hset(f"{WAL_ENTRY_PREFIX}{eid}", "status", "done")
+
+# SAGAG
+
+# this uses optmistic locking 
+def _apply_pay(user_id: str, amount: int, done_key: str) -> bool:
+    for _ in range(10):
+        try:
+            # uses watch
+            with db.pipeline() as pipe:
+                pipe.watch(user_id, done_key)
+                if pipe.exists(done_key):
+                    pipe.reset()
+                    return False  # already processed 
+                raw = pipe.get(user_id) # read users data
+                if not raw:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                new_credit = user_entry.credit - amount
+                if new_credit < 0:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} insufficient credit!")
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit))) 
+                pipe.set(done_key, "1", ex=86400)  # idempotency key
+                pipe.execute()
+                return True
+        except redis.WatchError:
+            continue
+    abort(500, "whomp whomp")
+
+def _apply_refund(user_id: str, amount: int, comp_key: str) -> bool:
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id, comp_key) # basically see if there are changes
+                if pipe.exists(comp_key):
+                    pipe.reset()
+                    return False
+                raw = pipe.get(user_id)
+                if not raw:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(UserValue(credit=user_entry.credit + amount)))
+                pipe.set(comp_key, "1", ex=86400)
+                pipe.execute()
+                return True
+        except redis.WatchError:
+            continue
+    abort(500, "whomp whomp")
+
+
+# 2PC
+def _apply_2pc_commit(tx_id: str):
+    prepare_key = f"prepare:{tx_id}"
+    prepare_raw = db.get(prepare_key)
+    if not prepare_raw:
+        return  
+    record = msgpack.decode(prepare_raw, type=PrepareRecord)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(record.user_id, prepare_key)
+                if not pipe.exists(prepare_key):
+                    pipe.reset()
+                    return 
+                raw = pipe.get(record.user_id)
+
+                if not raw:
+                    pipe.reset()
+                    return
+                user_entry = msgpack.decode(raw, type=UserValue)
+                new_credit = user_entry.credit - record.amount
+
+                if new_credit < 0:
+                    pipe.reset()
+                    return  
+                pipe.multi()
+                pipe.set(record.user_id, msgpack.encode(UserValue(credit=new_credit)))
+                pipe.delete(prepare_key)
+                pipe.execute()
+                db.eval(_RELEASE_LOCK_SCRIPT, 1, f"lock:{record.user_id}", tx_id)
+                return
+        except redis.WatchError:
+            continue
+    abort(500, "dun dun dun")
+
+# deletes prepare record and locks are released
+def _apply_2pc_abort(tx_id: str):
+    prepare_key = f"prepare:{tx_id}"
+    prepare_raw = db.get(prepare_key)
+    if not prepare_raw:
+        return  
+    record = msgpack.decode(prepare_raw, type=PrepareRecord)
+    db.delete(prepare_key)
+    db.eval(_RELEASE_LOCK_SCRIPT, 1, f"lock:{record.user_id}", tx_id)
+
+
+# Crash Revory for Write ahead log
+# this is so it checks the log for pending and replays them basically 
+def recover_from_wal():
+    try:
+        entries = db.xrange(WAL_STREAM)
+    except redis.exceptions.RedisError:
+        app.logger.warning("y")
+        return
+    for _, fields in entries:
+        eid = fields.get(b"eid", b"").decode()
+        if not eid:
+            continue
+        entry = db.hgetall(f"{WAL_ENTRY_PREFIX}{eid}")
+        if not entry or entry.get(b"status", b"").decode() != "pending":
+            continue
+        op = entry.get(b"op", b"").decode()
+        user_id = entry.get(b"user_id", b"").decode()
+        amount = int(entry.get(b"amount", b"0").decode())
+        ref_id = entry.get(b"ref_id", b"").decode()
+        app.logger.info(f"WAL recovery: replaying op={op} ref={ref_id}")
+
+        try:
+            if op == "saga_pay":
+                _apply_pay(user_id, amount, f"saga:done:{ref_id}")
+            elif op == "saga_compensate":
+                _apply_refund(user_id, amount, f"saga:comp:{ref_id}")
+            elif op == "2pc_commit":
+                _apply_2pc_commit(ref_id)
+            elif op == "2pc_abort":
+                _apply_2pc_abort(ref_id)
+
+        except Exception as e:
+            app.logger.error(f"WAL eid={eid}: {e}")
+            continue
+        wal_done(eid)
 
 @app.post('/create_user')
 def create_user():
@@ -106,9 +273,71 @@ def remove_credit(user_id: str, amount: int):
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
+# Endpoints added but for SAGA
+
+@app.post('/saga/pay/<user_id>/<amount>/<saga_id>')
+def saga_pay(user_id: str, amount: int, saga_id: str):
+    done_key = f"saga:done:{saga_id}"
+    eid = wal_append("saga_pay", saga_id, user_id, int(amount))
+    already_done = not _apply_pay(user_id, int(amount), done_key)
+    wal_done(eid)
+    if already_done:
+        return Response(f"Already processed saga: {saga_id}", status=200)
+    return Response(f"User: {user_id} charged {amount}", status=200)
+
+
+@app.post('/saga/compensate/pay/<user_id>/<amount>/<saga_id>')
+def saga_compensate_pay(user_id: str, amount: int, saga_id: str):
+    comp_key = f"saga:comp:{saga_id}"
+    eid = wal_append("saga_compensate", saga_id, user_id, int(amount))
+    already_done = not _apply_refund(user_id, int(amount), comp_key)
+    wal_done(eid)
+    if already_done:
+        return Response(f"Already compensated saga: {saga_id}", status=200)
+    return Response(f"User: {user_id} refunded {amount}", status=200)
+
+
+# 2PC endpoints added 
+
+@app.post('/2pc/prepare/<user_id>/<amount>/<tx_id>')
+def twopc_prepare(user_id: str, amount: int, tx_id: str):
+    amount = int(amount)
+    lock_key = f"lock:{user_id}"
+    acquired = db.set(lock_key, tx_id, nx=True, ex=30)
+    if not acquired:
+        abort(400, f"User: {user_id} is locked by another transaction")
+    user_entry = get_user_from_db(user_id)
+    if user_entry.credit < amount:
+        db.eval(_RELEASE_LOCK_SCRIPT, 1, lock_key, tx_id)
+        abort(400, f"User: {user_id} insufficient credit (has {user_entry.credit}, needs {amount})")
+    try:
+        db.set(f"prepare:{tx_id}", msgpack.encode(PrepareRecord(user_id=user_id, amount=amount)), ex=60)
+    except redis.exceptions.RedisError:
+        db.eval(_RELEASE_LOCK_SCRIPT, 1, lock_key, tx_id)
+        abort(400, DB_ERROR_STR)
+    return jsonify({"status": "prepared", "tx_id": tx_id})
+
+
+@app.post('/2pc/commit/<tx_id>')
+def twopc_commit(tx_id: str):
+    eid = wal_append("2pc_commit", tx_id)
+    _apply_2pc_commit(tx_id)
+    wal_done(eid)
+    return jsonify({"status": "committed", "tx_id": tx_id})
+
+
+@app.post('/2pc/abort/<tx_id>')
+def twopc_abort(tx_id: str):
+    eid = wal_append("2pc_abort", tx_id)
+    _apply_2pc_abort(tx_id)
+    wal_done(eid)
+    return jsonify({"status": "aborted", "tx_id": tx_id})
+
 if __name__ == '__main__':
+    recover_from_wal()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    recover_from_wal()
