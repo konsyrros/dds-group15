@@ -30,6 +30,15 @@ class StockValue(Struct):
     stock: int
     price: int
 
+class StockTxValue(Struct):
+    item_id: str
+    amount: int
+    subtracted: bool
+    compensated: bool
+
+def tx_key(tx_id: str):
+    return f"stock_tx:{tx_id}"
+
 
 def get_item_from_db(item_id: str) -> StockValue | None:
     # get serialized data
@@ -108,6 +117,68 @@ def remove_stock(item_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
+@app.post('/subtract_tx/<tx_id>/<item_id>/<amount>')
+def subtract_stock_tx(tx_id: str, item_id: str, amount: int):
+    amount = int(amount)
+
+    # Check if transaction already exists
+    try:
+        raw = db.get(tx_key(tx_id))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    if raw:
+        tx = msgpack.decode(raw, type=StockTxValue)
+        if tx.subtracted:
+            return Response("Stock already subtracted (idempotent)", status=200)
+
+    item_entry: StockValue = get_item_from_db(item_id)
+
+    if item_entry.stock - amount < 0:
+        abort(400, f"Item: {item_id} out of stock")
+
+    item_entry.stock -= amount
+
+    try:
+        db.set(item_id, msgpack.encode(item_entry))
+        db.set(tx_key(tx_id), msgpack.encode(
+            StockTxValue(item_id=item_id, amount=amount, subtracted=True, compensated=False)
+        ))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    return Response("Stock subtraction successful", status=200)
+
+
+
+@app.post('/add_tx/<tx_id>')
+def add_stock_tx(tx_id: str):
+
+    try:
+        raw = db.get(tx_key(tx_id))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    if not raw:
+        abort(400, "Unknown tx_id")
+
+    tx = msgpack.decode(raw, type=StockTxValue)
+
+    if tx.compensated:
+        return Response("Stock already compensated (idempotent)", status=200)
+
+    item_entry: StockValue = get_item_from_db(tx.item_id)
+
+    item_entry.stock += tx.amount
+
+    try:
+        db.set(tx.item_id, msgpack.encode(item_entry))
+        tx.compensated = True
+        db.set(tx_key(tx_id), msgpack.encode(tx))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    return Response("Stock compensation successful", status=200)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

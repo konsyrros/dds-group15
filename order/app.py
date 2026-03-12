@@ -21,9 +21,10 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 TX_MODE = os.getenv("TX_MODE", "SAGA").upper()
 if TX_MODE not in ("SAGA", "2PC"):
     raise ValueError(f"Invalid TX_MODE={TX_MODE}. Use SAGA or 2PC.")
-app.logger.info(f"Transaction mode: {TX_MODE}")
+
 
 app = Flask("order-service")
+app.logger.info(f"Transaction mode: {TX_MODE}")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -154,13 +155,16 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
+    app.logger.info(f"checkout called for order_id={order_id} with TX_MODE={TX_MODE}")
     if TX_MODE == "SAGA":
+        app.logger.info("Entering SAGA checkout")
         return checkout_saga(order_id)
     else:  # "2PC"
+        app.logger.info("Entering BASELINE checkout")
         return checkout_baseline(order_id)
 
 def checkout_saga(order_id: str):
-    app.logger.debug(f"[SAGA] Checking out {order_id}")
+    app.logger.info(f"[SAGA] Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
 
     # If already paid, make checkout idempotent at order level too
@@ -186,10 +190,13 @@ def checkout_saga(order_id: str):
 
     # 2) Subtract stock
     for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        # stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract_tx/{tx_id}/{item_id}/{quantity}")
         if stock_reply.status_code != 200:
             # 3) Compensation: undo any stock removed + refund payment
-            rollback_stock(removed_items)
+            # rollback_stock(removed_items)
+            
+            send_post_request(f"{GATEWAY_URL}/stock/add_tx/{tx_id}")
             send_post_request(f"{GATEWAY_URL}/payment/refund_tx/{tx_id}")
             abort(400, f"Out of stock on item_id: {item_id}")
 
@@ -206,7 +213,7 @@ def checkout_saga(order_id: str):
 
 
 def checkout_baseline(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.info(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
     items_quantities: dict[str, int] = defaultdict(int)
