@@ -14,6 +14,15 @@ from flask import Flask, jsonify, abort, Response
 # TODO: right now we have saga compensation + tx idempotent payment -> rebuild and run to verify saga is being used with the order service + do failure test to ensure compensation works
 # TODO 2: incorporate add_tx and subtract_tx to the stock so stock operations become idempotent too
 
+# Checkout test commands
+# curl -X POST http://localhost:8000/payment/create_user
+# curl -X POST http://localhost:8000/payment/add_funds/USER_ID/1000
+# curl -X POST http://localhost:8000/stock/item/create/10
+# curl -X POST http://localhost:8000/stock/add/ITEM_ID/50
+# curl -X POST http://localhost:8000/orders/create/USER_ID
+# curl -X POST http://localhost:8000/orders/addItem/ORDER_ID/ITEM_ID/2
+# curl -X POST http://localhost:8000/orders/checkout/ORDER_ID
+
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
