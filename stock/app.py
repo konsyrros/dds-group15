@@ -36,8 +36,8 @@ class StockTxValue(Struct):
     subtracted: bool
     compensated: bool
 
-def tx_key(tx_id: str):
-    return f"stock_tx:{tx_id}"
+def tx_key(tx_id: str, item_id: str):
+    return f"stock_tx:{tx_id}:{item_id}"
 
 
 def get_item_from_db(item_id: str) -> StockValue | None:
@@ -123,7 +123,7 @@ def subtract_stock_tx(tx_id: str, item_id: str, amount: int):
 
     # Check if transaction already exists
     try:
-        raw = db.get(tx_key(tx_id))
+        raw = db.get(tx_key(tx_id, item_id))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
 
@@ -141,7 +141,7 @@ def subtract_stock_tx(tx_id: str, item_id: str, amount: int):
 
     try:
         db.set(item_id, msgpack.encode(item_entry))
-        db.set(tx_key(tx_id), msgpack.encode(
+        db.set(tx_key(tx_id, item_id), msgpack.encode(
             StockTxValue(item_id=item_id, amount=amount, subtracted=True, compensated=False)
         ))
     except redis.exceptions.RedisError:
@@ -151,11 +151,11 @@ def subtract_stock_tx(tx_id: str, item_id: str, amount: int):
 
 
 
-@app.post('/add_tx/<tx_id>')
-def add_stock_tx(tx_id: str):
+@app.post('/add_tx/<tx_id>/<item_id>')
+def add_stock_tx(tx_id: str, item_id: str):
 
     try:
-        raw = db.get(tx_key(tx_id))
+        raw = db.get(tx_key(tx_id, item_id))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
 
@@ -174,7 +174,7 @@ def add_stock_tx(tx_id: str):
     try:
         db.set(tx.item_id, msgpack.encode(item_entry))
         tx.compensated = True
-        db.set(tx_key(tx_id), msgpack.encode(tx))
+        db.set(tx_key(tx_id, item_id), msgpack.encode(tx))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
 
