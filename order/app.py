@@ -11,9 +11,6 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-# TODO: right now we have saga compensation + tx idempotent payment -> rebuild and run to verify saga is being used with the order service + do failure test to ensure compensation works
-# TODO 2: incorporate add_tx and subtract_tx to the stock so stock operations become idempotent too
-
 # Checkout test commands
 # curl -X POST http://localhost:8000/payment/create_user
 # curl -X POST http://localhost:8000/payment/add_funds/USER_ID/1000
@@ -239,11 +236,9 @@ def checkout_saga(order_id: str):
 
     # 2) Subtract stock
     for item_id, quantity in items_quantities.items():
-        # stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
         stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract_tx/{tx_id}/{item_id}/{quantity}")
         if stock_reply.status_code != 200:
             # 3) Compensation: undo any stock removed + refund payment
-            # rollback_stock(removed_items)
             
             for removed_item_id, quantity in removed_items:
                 send_post_request(f"{GATEWAY_URL}/stock/add_tx/{tx_id}/{removed_item_id}")
