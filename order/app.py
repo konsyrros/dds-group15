@@ -11,19 +11,33 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+# Checkout test commands
+# curl -X POST http://localhost:8000/payment/create_user
+# curl -X POST http://localhost:8000/payment/add_funds/USER_ID/1000
+# curl -X POST http://localhost:8000/stock/item/create/10
+# curl -X POST http://localhost:8000/stock/add/ITEM_ID/50
+# curl -X POST http://localhost:8000/orders/create/USER_ID
+# curl -X POST http://localhost:8000/orders/addItem/ORDER_ID/ITEM_ID/2
+# curl -X POST http://localhost:8000/orders/checkout/ORDER_ID
+
+# checking that payment did not decrease (refund): curl -i http://localhost:8000/payment/find_user/USER_ID
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
+TX_MODE = os.getenv("TX_MODE", "SAGA").upper()
+if TX_MODE not in ("SAGA", "2PC"):
+    raise ValueError(f"Invalid TX_MODE={TX_MODE}. Use SAGA or 2PC.")
+
 
 app = Flask("order-service")
+app.logger.info(f"Transaction mode: {TX_MODE}")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-
 
 def close_db_connection():
     db.close()
@@ -38,6 +52,37 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
+
+class SagaState(Struct):
+    order_id: str
+    tx_id: str
+    state: str 
+
+
+def saga_key(tx_id: str):
+    return f"saga:{tx_id}"
+
+def recover_incomplete_sagas():
+    app.logger.info("Scanning for incomplete sagas...")
+
+    try:
+        for key in db.scan_iter("saga:*"):
+            raw = db.get(key)
+            if not raw:
+                continue
+
+            saga = msgpack.decode(raw, type=SagaState)
+
+            if saga.state != "COMPLETED":
+                app.logger.warning(
+                    f"Found incomplete saga tx_id={saga.tx_id}, state={saga.state}, order_id={saga.order_id}"
+                )
+
+    except redis.exceptions.RedisError:
+        app.logger.error("Failed to scan saga records during startup")
+
+
+recover_incomplete_sagas()
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -148,7 +193,80 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.info(f"checkout called for order_id={order_id} with TX_MODE={TX_MODE}")
+    if TX_MODE == "SAGA":
+        app.logger.info("Entering SAGA checkout")
+        return checkout_saga(order_id)
+    else:  # "2PC"
+        app.logger.info("Entering BASELINE checkout")
+        return checkout_baseline(order_id)
+
+def checkout_saga(order_id: str):
+    app.logger.info(f"[SAGA] Checking out {order_id}")
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # If already paid, make checkout idempotent at order level too
+    if order_entry.paid:
+        return Response("Already paid (idempotent)", status=200)
+
+    # Group quantities per item
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+
+    tx_id = str(uuid.uuid4())
+    saga = SagaState(
+        order_id = order_id,
+        tx_id = tx_id,
+        state = "STARTED"
+    )
+    db.set(saga_key(tx_id), msgpack.encode(saga))
+    app.logger.info(f"[SAGA] order_id={order_id} tx_id={tx_id}")
+
+    # 1) Pay first (so we can compensate if stock fails)
+    pay_reply = send_post_request(
+        f"{GATEWAY_URL}/payment/pay_tx/{tx_id}/{order_entry.user_id}/{order_entry.total_cost}"
+    )
+    if pay_reply.status_code != 200:
+        abort(400, "Payment failed")
+
+    removed_items: list[tuple[str, int]] = []
+    saga.state = "PAYMENT_DONE"
+    db.set(saga_key(tx_id), msgpack.encode(saga))
+
+    # 2) Subtract stock
+    for item_id, quantity in items_quantities.items():
+        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract_tx/{tx_id}/{item_id}/{quantity}")
+        if stock_reply.status_code != 200:
+            # 3) Compensation: undo any stock removed + refund payment
+            
+            for removed_item_id, quantity in removed_items:
+                send_post_request(f"{GATEWAY_URL}/stock/add_tx/{tx_id}/{removed_item_id}")
+            send_post_request(f"{GATEWAY_URL}/payment/refund_tx/{tx_id}")
+            
+            saga.state = "COMPENSATED"
+            db.set(saga_key(tx_id), msgpack.encode(saga))
+            abort(400, f"Out of stock on item_id: {item_id}")
+
+        removed_items.append((item_id, quantity))
+
+    saga.state = "STOCK_DONE"
+    db.set(saga_key(tx_id), msgpack.encode(saga))
+
+    # 4) Mark order paid (final step)
+    order_entry.paid = True
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+        saga.state = "COMPLETED"
+        db.set(saga_key(tx_id), msgpack.encode(saga))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    return Response("Checkout successful (SAGA)", status=200)
+
+
+def checkout_baseline(order_id: str):
+    app.logger.info(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
     items_quantities: dict[str, int] = defaultdict(int)
