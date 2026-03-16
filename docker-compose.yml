@@ -17,11 +17,16 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+<<<<<<< claudia_changes
+      - TX_MODE=SAGA
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+=======
       - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
       - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+>>>>>>> main
     env_file:
       - env/order_redis.env
     depends_on:
