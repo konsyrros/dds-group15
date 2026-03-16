@@ -56,7 +56,58 @@ class OrderValue(Struct):
 class SagaState(Struct):
     order_id: str
     tx_id: str
-    state: str 
+    state: str
+    
+    
+class TxLog(Struct):
+    tx_id: str
+    order_id: str
+    phase: str
+    stock_votes: dict[str, str]
+    payment_vote: str
+    
+    
+def item_tx_id(tx_id: str, item_id: str) -> str:
+    return f"{tx_id}:{item_id}"
+    
+    
+def wal_key(tx_id: str) -> str:
+    return f"2pc:{tx_id}"
+
+
+def wal_write(tx_log: TxLog):
+    """Persist transaction state before acting on it (write-ahead)."""
+    try:
+        db.set(wal_key(tx_log.tx_id), msgpack.encode(tx_log), ex=300)
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+
+def wal_read(tx_id: str) -> TxLog | None:
+    """Read back a transaction log entry, returns None if not found."""
+    try:
+        raw = db.get(wal_key(tx_id))
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+    return msgpack.decode(raw, type=TxLog) if raw else None
+
+
+def recover_incomplete_2pc():
+    app.logger.info("Scanning for incomplete 2PC transactions...")
+    try:
+        for key in db.scan_iter("2pc:*"):
+            raw = db.get(key)
+            if not raw:
+                continue
+            log = msgpack.decode(raw, type=TxLog)
+            if log.phase not in ("COMMITTED", "ABORTED"):
+                app.logger.warning(
+                    f"[2PC] In-doubt tx_id={log.tx_id} order_id={log.order_id} "
+                    f"phase={log.phase} stock_votes={log.stock_votes} "
+                    f"payment={log.payment_vote}"
+                )
+    except redis.exceptions.RedisError:
+        app.logger.error("[2PC] Failed to scan WAL records during startup")
 
 
 def saga_key(tx_id: str):
@@ -82,7 +133,15 @@ def recover_incomplete_sagas():
         app.logger.error("Failed to scan saga records during startup")
 
 
-recover_incomplete_sagas()
+def run_startup_recovery():
+    if TX_MODE == "SAGA":
+        recover_incomplete_sagas()
+    else:
+        recover_incomplete_2pc()
+
+
+with app.app_context():
+    run_startup_recovery()
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -198,8 +257,8 @@ def checkout(order_id: str):
         app.logger.info("Entering SAGA checkout")
         return checkout_saga(order_id)
     else:  # "2PC"
-        app.logger.info("Entering BASELINE checkout")
-        return checkout_baseline(order_id)
+        app.logger.info("Entering 2PC checkout")
+        return checkout_2pc(order_id)
 
 def checkout_saga(order_id: str):
     app.logger.info(f"[SAGA] Checking out {order_id}")
@@ -265,35 +324,89 @@ def checkout_saga(order_id: str):
     return Response("Checkout successful (SAGA)", status=200)
 
 
-def checkout_baseline(order_id: str):
-    app.logger.info(f"Checking out {order_id}")
+def checkout_2pc(order_id: str):
+    app.logger.info(f"[2PC] Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+
+    if order_entry.paid:
+        return Response("Already paid (idempotent)", status=200)
+
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
+
+    tx_id = str(uuid.uuid4())
+
+    log = TxLog(
+        tx_id=tx_id,
+        order_id=order_id,
+        phase="PREPARING",
+        stock_votes={item_id: "PENDING" for item_id in items_quantities},
+        payment_vote="PENDING"
+    )
+    wal_write(log)
+
     for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
+        stock_reply = send_post_request(
+            f"{GATEWAY_URL}/stock/transaction/prepare/{item_tx_id(tx_id, item_id)}/{item_id}/{quantity}"
+        )
+        log.stock_votes[item_id] = "YES" if stock_reply.status_code == 200 else "NO"
+        wal_write(log)
+        if log.stock_votes[item_id] == "NO":
+            break
+
+    if all(v == "YES" for v in log.stock_votes.values()):
+        payment_reply = send_post_request(
+            f"{GATEWAY_URL}/payment/2pc/prepare/{order_entry.user_id}/{order_entry.total_cost}/{tx_id}"
+        )
+        log.payment_vote = "YES" if payment_reply.status_code == 200 else "NO"
+        wal_write(log)
+
+    log.phase = "PREPARED"
+    wal_write(log)
+
+    all_yes = (
+        all(v == "YES" for v in log.stock_votes.values())
+        and log.payment_vote == "YES"
+    )
+
+    if not all_yes:
+        log.phase = "ABORTING"
+        wal_write(log)
+
+        for item_id, vote in log.stock_votes.items():
+            if vote == "YES":
+                send_post_request(
+                    f"{GATEWAY_URL}/stock/transaction/cancel/{item_tx_id(tx_id, item_id)}"
+                )
+
+        if log.payment_vote == "YES":
+            send_post_request(f"{GATEWAY_URL}/payment/2pc/abort/{tx_id}")
+
+        log.phase = "ABORTED"
+        wal_write(log)
+        abort(400, f"2PC aborted: stock_votes={log.stock_votes} payment={log.payment_vote}")
+
+    log.phase = "COMMITTING"
+    wal_write(log)
+
+    for item_id in items_quantities:
+        send_post_request(
+            f"{GATEWAY_URL}/stock/transaction/commit/{item_tx_id(tx_id, item_id)}"
+        )
+
+    send_post_request(f"{GATEWAY_URL}/payment/2pc/commit/{tx_id}")
+
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+        abort(400, DB_ERROR_STR)
+
+    log.phase = "COMMITTED"
+    wal_write(log)
+
+    return Response("Checkout successful (2PC)", status=200)
 
 
 if __name__ == '__main__':
