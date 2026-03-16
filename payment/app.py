@@ -8,6 +8,36 @@ import redis
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+# curl.exe -s -X POST http://localhost:8000/payment/create_user
+# curl.exe -s -X POST http://localhost:8000/payment/add_funds/<NEW_USER_ID>/100
+# curl.exe -s http://localhost:8000/payment/find_user/<NEW_USER_ID>
+
+# curl.exe -s -X POST http://localhost:8000/payment/add_funds/<>/100
+
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+# SAGA 
+# curl.exe -s -X POST http://localhost:8000/payment/saga/pay/<>/30/saga-001
+
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+# curl.exe -s -X POST http://localhost:8000/payment/saga/compensate/pay/<>/30/saga-001
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+# 2PC
+
+# curl.exe -s -X POST http://localhost:8000/payment/2pc/prepare/<>/40/tx-001
+
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+# curl.exe -s -X POST http://localhost:8000/payment/2pc/commit/tx-001
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+# curl.exe -s -X POST http://localhost:8000/payment/2pc/prepare/<>/40/tx-002
+# curl.exe -s -X POST http://localhost:8000/payment/2pc/abort/tx-002
+# curl.exe -s http://localhost:8000/payment/find_user/<>
+
+
 DB_ERROR_STR = "DB error"
 WAL_STREAM = "wal:payment"
 WAL_ENTRY_PREFIX = "wal:entry:"
