@@ -17,8 +17,16 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+<<<<<<< claudia_changes
       - TX_MODE=SAGA
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+=======
+      - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
+      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
+      - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+>>>>>>> main
     env_file:
       - env/order_redis.env
     depends_on:
@@ -26,12 +34,17 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - order-db-data:/data
 
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -39,12 +52,17 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - stock-db-data:/data
 
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -52,4 +70,11 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - payment-db-data:/data
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
