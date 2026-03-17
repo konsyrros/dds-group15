@@ -77,6 +77,18 @@ def decode_entry(entry: bytes | None, entry_type: type[Struct]):
     return msgpack.decode(entry, type=entry_type) if entry else None
 
 
+def load_legacy_saga_transaction(
+    client: redis.Redis | redis.client.Pipeline,
+    tx_id: str,
+    item_id: str
+) -> StockTxValue | None:
+    try:
+        entry: bytes = client.get(tx_key(tx_id, item_id))
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+    return decode_entry(entry, StockTxValue)
+
+
 def load_item(client: redis.Redis | redis.client.Pipeline, item_id: str) -> StockValue:
     try:
         entry: bytes = client.get(get_item_key(item_id))
@@ -437,65 +449,74 @@ def commit_stock(tx_id: str):
 @app.post('/subtract_tx/<tx_id>/<item_id>/<amount>')
 def subtract_stock_tx(tx_id: str, item_id: str, amount: int):
     amount = int(amount)
+    item_storage_key = get_item_key(item_id)
+    legacy_tx_key = tx_key(tx_id, item_id)
 
-    # Check if transaction already exists
-    try:
-        raw = db.get(tx_key(tx_id, item_id))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    for _ in range(MAX_RETRIES):
+        with db.pipeline() as pipe:
+            try:
+                pipe.watch(item_storage_key, legacy_tx_key)
+                tx_entry = load_legacy_saga_transaction(pipe, tx_id, item_id)
+                if tx_entry is not None:
+                    if tx_entry.amount != amount:
+                        abort(409, "Transaction id reused with different parameters")
+                    if tx_entry.compensated:
+                        abort(409, f"Transaction: {tx_id} has already been compensated")
+                    if tx_entry.subtracted:
+                        return Response("Stock already subtracted (idempotent)", status=200)
 
-    if raw:
-        tx = msgpack.decode(raw, type=StockTxValue)
-        if tx.subtracted:
-            return Response("Stock already subtracted (idempotent)", status=200)
+                item_entry = load_item(pipe, item_id)
+                if item_entry.stock < amount:
+                    abort(400, f"Item: {item_id} out of stock")
 
-    item_entry: StockValue = get_item_from_db(item_id)
+                item_entry.stock -= amount
+                pipe.multi()
+                pipe.set(item_storage_key, msgpack.encode(item_entry))
+                pipe.set(
+                    legacy_tx_key,
+                    msgpack.encode(
+                        StockTxValue(item_id=item_id, amount=amount, subtracted=True, compensated=False)
+                    )
+                )
+                pipe.execute()
+                return Response("Stock subtraction successful", status=200)
+            except redis.exceptions.WatchError:
+                continue
 
-    if item_entry.stock - amount < 0:
-        abort(400, f"Item: {item_id} out of stock")
-
-    item_entry.stock -= amount
-
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-        db.set(tx_key(tx_id, item_id), msgpack.encode(
-            StockTxValue(item_id=item_id, amount=amount, subtracted=True, compensated=False)
-        ))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-
-    return Response("Stock subtraction successful", status=200)
+    abort(409, "Concurrent stock transaction, please retry")
 
 
 
 @app.post('/add_tx/<tx_id>/<item_id>')
 def add_stock_tx(tx_id: str, item_id: str):
+    item_storage_key = get_item_key(item_id)
+    legacy_tx_key = tx_key(tx_id, item_id)
 
-    try:
-        raw = db.get(tx_key(tx_id, item_id))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    for _ in range(MAX_RETRIES):
+        with db.pipeline() as pipe:
+            try:
+                pipe.watch(item_storage_key, legacy_tx_key)
+                tx_entry = load_legacy_saga_transaction(pipe, tx_id, item_id)
+                if tx_entry is None:
+                    abort(400, "Unknown tx_id")
+                if tx_entry.compensated:
+                    return Response("Stock already compensated (idempotent)", status=200)
+                if not tx_entry.subtracted:
+                    abort(409, f"Transaction: {tx_id} has not subtracted stock")
 
-    if not raw:
-        abort(400, "Unknown tx_id")
+                item_entry = load_item(pipe, tx_entry.item_id)
+                item_entry.stock += tx_entry.amount
+                tx_entry.compensated = True
 
-    tx = msgpack.decode(raw, type=StockTxValue)
+                pipe.multi()
+                pipe.set(get_item_key(tx_entry.item_id), msgpack.encode(item_entry))
+                pipe.set(legacy_tx_key, msgpack.encode(tx_entry))
+                pipe.execute()
+                return Response("Stock compensation successful", status=200)
+            except redis.exceptions.WatchError:
+                continue
 
-    if tx.compensated:
-        return Response("Stock already compensated (idempotent)", status=200)
-
-    item_entry: StockValue = get_item_from_db(tx.item_id)
-
-    item_entry.stock += tx.amount
-
-    try:
-        db.set(tx.item_id, msgpack.encode(item_entry))
-        tx.compensated = True
-        db.set(tx_key(tx_id, item_id), msgpack.encode(tx))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-
-    return Response("Stock compensation successful", status=200)
+    abort(409, "Concurrent stock transaction, please retry")
 
 @app.post("/transaction/cancel/<tx_id>")
 def cancel_stock(tx_id: str):
