@@ -2,11 +2,13 @@ import logging
 import os
 import atexit
 import uuid
+from typing import Any
 
 import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+from redis_queue import RedisCommandQueue, queued_json, queued_text
 
 # curl.exe -s -X POST http://localhost:8000/payment/create_user
 # curl.exe -s -X POST http://localhost:8000/payment/add_funds/<NEW_USER_ID>/100
@@ -44,10 +46,13 @@ WAL_ENTRY_PREFIX = "wal:entry:"
 
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+def create_redis_client() -> redis.Redis:
+    return redis.Redis(host=os.environ['REDIS_HOST'],
+                       port=int(os.environ['REDIS_PORT']),
+                       password=os.environ['REDIS_PASSWORD'],
+                       db=int(os.environ['REDIS_DB']))
+
+db: redis.Redis = create_redis_client()
 
 def close_db_connection():
     db.close()
@@ -250,19 +255,34 @@ def recover_from_wal():
             continue
         wal_done(eid)
 
-@app.post('/create_user')
-def create_user():
+def execute_queued_command(operation: str, **payload: Any):
+    try:
+        result = command_queue.execute(operation, **payload)
+    except TimeoutError:
+        abort(503, "Queue timeout")
+    except RuntimeError:
+        abort(503, DB_ERROR_STR)
+    if not result["ok"]:
+        abort(int(result["status"]), result["body"])
+    response = result["response"]
+    if response["kind"] == "json":
+        flask_response = jsonify(response["body"])
+        flask_response.status_code = int(response["status"])
+        return flask_response
+    return Response(response["body"], status=int(response["status"]))
+
+
+def op_create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
+        abort(400, DB_ERROR_STR)
+    return queued_json({'user_id': key})
 
 
-@app.post('/batch_init/<n>/<starting_money>')
-def batch_init_users(n: int, starting_money: int):
+def op_batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
@@ -270,8 +290,8 @@ def batch_init_users(n: int, starting_money: int):
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for users successful"})
+        abort(400, DB_ERROR_STR)
+    return queued_json({"msg": "Batch init for users successful"})
 
 
 @app.get('/find_user/<user_id>')
@@ -285,20 +305,18 @@ def find_user(user_id: str):
     )
 
 
-@app.post('/add_funds/<user_id>/<amount>')
-def add_credit(user_id: str, amount: int):
+def op_add_credit(user_id: str, amount: int):
     user_entry: UserValue = get_user_from_db(user_id)
     # update credit, serialize and update database
     user_entry.credit += int(amount)
     try:
         db.set(user_id, msgpack.encode(user_entry))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        abort(400, DB_ERROR_STR)
+    return queued_text(f"User: {user_id} credit updated to: {user_entry.credit}")
 
 
-@app.post('/pay/<user_id>/<amount>')
-def remove_credit(user_id: str, amount: int):
+def op_remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = get_user_from_db(user_id)
     # update credit, serialize and update database
@@ -308,23 +326,22 @@ def remove_credit(user_id: str, amount: int):
     try:
         db.set(user_id, msgpack.encode(user_entry))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        abort(400, DB_ERROR_STR)
+    return queued_text(f"User: {user_id} credit updated to: {user_entry.credit}")
 
-@app.post('/pay_tx/<tx_id>/<user_id>/<amount>')
-def pay_tx(tx_id: str, user_id: str, amount: int):
+def op_pay_tx(tx_id: str, user_id: str, amount: int):
     amount = int(amount)
 
     # If we've seen this tx before, return the same outcome (idempotent)
     try:
         raw = db.get(tx_key(tx_id))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
     if raw:
         tx = msgpack.decode(raw, type=TxValue)
         if tx.paid:
-            return Response("Already paid (idempotent)", status=200)
+            return queued_text("Already paid (idempotent)")
         else:
             abort(400, "Previous payment attempt failed")
 
@@ -338,7 +355,7 @@ def pay_tx(tx_id: str, user_id: str, amount: int):
                 paid=False, refunded=False, user_id=user_id, amount=amount
             )))
         except redis.exceptions.RedisError:
-            return abort(400, DB_ERROR_STR)
+            abort(400, DB_ERROR_STR)
         abort(400, "User out of credit")
 
     try:
@@ -347,17 +364,16 @@ def pay_tx(tx_id: str, user_id: str, amount: int):
             paid=True, refunded=False, user_id=user_id, amount=amount
         )))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
-    return Response("Payment successful", status=200)
+    return queued_text("Payment successful")
 
-@app.post('/refund_tx/<tx_id>')
-def refund_tx(tx_id: str):
+def op_refund_tx(tx_id: str):
     # Refund based on stored tx record (safer: no user/amount params needed)
     try:
         raw = db.get(tx_key(tx_id))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
     if not raw:
         abort(400, "Unknown tx_id")
@@ -369,7 +385,7 @@ def refund_tx(tx_id: str):
         abort(400, "Cannot refund: tx not paid")
 
     if tx.refunded:
-        return Response("Already refunded (idempotent)", status=200)
+        return queued_text("Already refunded (idempotent)")
 
     user_entry: UserValue = get_user_from_db(tx.user_id)
     user_entry.credit += tx.amount
@@ -379,40 +395,37 @@ def refund_tx(tx_id: str):
         tx.refunded = True
         db.set(tx_key(tx_id), msgpack.encode(tx))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
-    return Response("Refund successful", status=200)
+    return queued_text("Refund successful")
 
 
 
 # Endpoints added but for SAGA
 
-@app.post('/saga/pay/<user_id>/<amount>/<saga_id>')
-def saga_pay(user_id: str, amount: int, saga_id: str):
+def op_saga_pay(user_id: str, amount: int, saga_id: str):
     done_key = f"saga:done:{saga_id}"
     eid = wal_append("saga_pay", saga_id, user_id, int(amount))
     already_done = not _apply_pay(user_id, int(amount), done_key)
     wal_done(eid)
     if already_done:
-        return Response(f"Already processed saga: {saga_id}", status=200)
-    return Response(f"User: {user_id} charged {amount}", status=200)
+        return queued_text(f"Already processed saga: {saga_id}")
+    return queued_text(f"User: {user_id} charged {amount}")
 
 
-@app.post('/saga/compensate/pay/<user_id>/<amount>/<saga_id>')
-def saga_compensate_pay(user_id: str, amount: int, saga_id: str):
+def op_saga_compensate_pay(user_id: str, amount: int, saga_id: str):
     comp_key = f"saga:comp:{saga_id}"
     eid = wal_append("saga_compensate", saga_id, user_id, int(amount))
     already_done = not _apply_refund(user_id, int(amount), comp_key)
     wal_done(eid)
     if already_done:
-        return Response(f"Already compensated saga: {saga_id}", status=200)
-    return Response(f"User: {user_id} refunded {amount}", status=200)
+        return queued_text(f"Already compensated saga: {saga_id}")
+    return queued_text(f"User: {user_id} refunded {amount}")
 
 
 # 2PC endpoints added 
 
-@app.post('/2pc/prepare/<user_id>/<amount>/<tx_id>')
-def twopc_prepare(user_id: str, amount: int, tx_id: str):
+def op_twopc_prepare(user_id: str, amount: int, tx_id: str):
     amount = int(amount)
     lock_key = f"lock:{user_id}"
     acquired = db.set(lock_key, tx_id, nx=True, ex=30)
@@ -427,23 +440,96 @@ def twopc_prepare(user_id: str, amount: int, tx_id: str):
     except redis.exceptions.RedisError:
         db.eval(_RELEASE_LOCK_SCRIPT, 1, lock_key, tx_id)
         abort(400, DB_ERROR_STR)
-    return jsonify({"status": "prepared", "tx_id": tx_id})
+    return queued_json({"status": "prepared", "tx_id": tx_id})
+
+
+def op_twopc_commit(tx_id: str):
+    eid = wal_append("2pc_commit", tx_id)
+    _apply_2pc_commit(tx_id)
+    wal_done(eid)
+    return queued_json({"status": "committed", "tx_id": tx_id})
+
+
+def op_twopc_abort(tx_id: str):
+    eid = wal_append("2pc_abort", tx_id)
+    _apply_2pc_abort(tx_id)
+    wal_done(eid)
+    return queued_json({"status": "aborted", "tx_id": tx_id})
+
+
+command_queue = RedisCommandQueue(
+    name="payment-service",
+    redis_factory=create_redis_client,
+    handlers={
+        "create_user": op_create_user,
+        "batch_init_users": op_batch_init_users,
+        "add_credit": op_add_credit,
+        "remove_credit": op_remove_credit,
+        "pay_tx": op_pay_tx,
+        "refund_tx": op_refund_tx,
+        "saga_pay": op_saga_pay,
+        "saga_compensate_pay": op_saga_compensate_pay,
+        "twopc_prepare": op_twopc_prepare,
+        "twopc_commit": op_twopc_commit,
+        "twopc_abort": op_twopc_abort,
+    },
+    logger=app.logger
+)
+
+
+@app.post('/create_user')
+def create_user():
+    return execute_queued_command("create_user")
+
+
+@app.post('/batch_init/<n>/<starting_money>')
+def batch_init_users(n: int, starting_money: int):
+    return execute_queued_command("batch_init_users", n=int(n), starting_money=int(starting_money))
+
+
+@app.post('/add_funds/<user_id>/<amount>')
+def add_credit(user_id: str, amount: int):
+    return execute_queued_command("add_credit", user_id=user_id, amount=int(amount))
+
+
+@app.post('/pay/<user_id>/<amount>')
+def remove_credit(user_id: str, amount: int):
+    return execute_queued_command("remove_credit", user_id=user_id, amount=int(amount))
+
+
+@app.post('/pay_tx/<tx_id>/<user_id>/<amount>')
+def pay_tx(tx_id: str, user_id: str, amount: int):
+    return execute_queued_command("pay_tx", tx_id=tx_id, user_id=user_id, amount=int(amount))
+
+
+@app.post('/refund_tx/<tx_id>')
+def refund_tx(tx_id: str):
+    return execute_queued_command("refund_tx", tx_id=tx_id)
+
+
+@app.post('/saga/pay/<user_id>/<amount>/<saga_id>')
+def saga_pay(user_id: str, amount: int, saga_id: str):
+    return execute_queued_command("saga_pay", user_id=user_id, amount=int(amount), saga_id=saga_id)
+
+
+@app.post('/saga/compensate/pay/<user_id>/<amount>/<saga_id>')
+def saga_compensate_pay(user_id: str, amount: int, saga_id: str):
+    return execute_queued_command("saga_compensate_pay", user_id=user_id, amount=int(amount), saga_id=saga_id)
+
+
+@app.post('/2pc/prepare/<user_id>/<amount>/<tx_id>')
+def twopc_prepare(user_id: str, amount: int, tx_id: str):
+    return execute_queued_command("twopc_prepare", user_id=user_id, amount=int(amount), tx_id=tx_id)
 
 
 @app.post('/2pc/commit/<tx_id>')
 def twopc_commit(tx_id: str):
-    eid = wal_append("2pc_commit", tx_id)
-    _apply_2pc_commit(tx_id)
-    wal_done(eid)
-    return jsonify({"status": "committed", "tx_id": tx_id})
+    return execute_queued_command("twopc_commit", tx_id=tx_id)
 
 
 @app.post('/2pc/abort/<tx_id>')
 def twopc_abort(tx_id: str):
-    eid = wal_append("2pc_abort", tx_id)
-    _apply_2pc_abort(tx_id)
-    wal_done(eid)
-    return jsonify({"status": "aborted", "tx_id": tx_id})
+    return execute_queued_command("twopc_abort", tx_id=tx_id)
 
 if __name__ == '__main__':
     recover_from_wal()
