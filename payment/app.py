@@ -175,7 +175,7 @@ def refund_tx(tx_id: str):
 
     user_entry: UserValue = get_user_from_db(tx.user_id)
     user_entry.credit += tx.amount
- 
+  
     try:
         db.set(tx.user_id, msgpack.encode(user_entry))
         tx.refunded = True
