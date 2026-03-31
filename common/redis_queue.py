@@ -33,7 +33,7 @@ class RedisCommandQueue:
         name: str,
         redis_factory: Callable[[], redis.Redis],
         handlers: dict[str, Callable[..., dict[str, Any]]],
-        logger: logging.Logger
+        logger: logging.Logger,
     ):
         self.name = name
         self.redis_factory = redis_factory
@@ -50,7 +50,7 @@ class RedisCommandQueue:
                 target=self._worker_loop,
                 args=(worker_client,),
                 name=f"{name}-queue-{index}",
-                daemon=True
+                daemon=True,
             )
             thread.start()
             self.worker_clients.append(worker_client)
@@ -64,11 +64,7 @@ class RedisCommandQueue:
 
     def execute(self, operation: str, **payload: Any) -> dict[str, Any]:
         result_key = f"{self.result_prefix}{uuid.uuid4().hex}"
-        command = {
-            "operation": operation,
-            "payload": payload,
-            "result_key": result_key
-        }
+        command = {"operation": operation, "payload": payload, "result_key": result_key}
         try:
             self.submit_client.rpush(self.queue_key, json.dumps(command))
             result = self.submit_client.blpop(result_key, timeout=QUEUE_RESULT_TIMEOUT_SECONDS)
@@ -100,12 +96,12 @@ class RedisCommandQueue:
     def _dispatch(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         handler = self.handlers.get(operation)
         if handler is None:
-            return {"ok": False, "status": 500, "body": f"Unknown queued operation: {operation}"}
+            return {"ok": False, "status": 400, "body": f"Unknown queued operation: {operation}"}
         try:
             response = handler(**payload)
             return {"ok": True, "response": response}
         except HTTPException as exc:
-            return {"ok": False, "status": exc.code or 500, "body": exc.description}
+            return {"ok": False, "status": exc.code or 400, "body": exc.description}
         except Exception:
             self.logger.exception("Unhandled error in queued operation %s", operation)
-            return {"ok": False, "status": 500, "body": "Internal server error"}
+            return {"ok": False, "status": 400, "body": "Internal server error"}
