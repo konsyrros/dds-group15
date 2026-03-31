@@ -148,7 +148,7 @@ It exposes:
   - `POST /transactions/start/<tx_id>/<user_id>/<amount>`
   - `POST /transactions/commit/<tx_id>`
   - `POST /transactions/rollback/<tx_id>`
-
+ 
 Like stock, payment does not know whether the orchestrator is running `SAGA` or `2PC`.
 
 Its responsibility is purely local:
