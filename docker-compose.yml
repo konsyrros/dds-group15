@@ -1,8 +1,8 @@
-version: "3"
 services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: unless-stopped
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -11,32 +11,36 @@ services:
       - order-service
       - stock-service
       - payment-service
+      - orchestrator-service
 
   order-service:
     build: ./order
     image: order:latest
+    restart: unless-stopped
     environment:
       - GATEWAY_URL=http://gateway:80
-      - TX_MODE=SAGA
-      - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
+      - ORCHESTRATOR_URL=http://orchestrator-service:5000
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
-      - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
-      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - orchestrator-service
 
   order-db:
     image: redis:7.2-bookworm
+    restart: unless-stopped
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
     volumes:
       - order-db-data:/data
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
+    restart: unless-stopped
     environment:
       - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
@@ -48,16 +52,21 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
+    restart: unless-stopped
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
     volumes:
       - stock-db-data:/data
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
+    restart: unless-stopped
     environment:
       - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
+      - PAYMENT_FAIL_ONCE_BEFORE_ROLLBACK_COMMIT=${PAYMENT_FAIL_ONCE_BEFORE_ROLLBACK_COMMIT:-0}
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
     env_file:
       - env/payment_redis.env
@@ -66,11 +75,48 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
+    restart: unless-stopped
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
     volumes:
       - payment-db-data:/data
+
+  orchestrator-service:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    image: orchestrator:latest
+    restart: unless-stopped
+    environment:
+      - TX_MODE=${TX_MODE:-SAGA}
+      - STOCK_SERVICE_URL=http://stock-service:5000
+      - PAYMENT_SERVICE_URL=http://payment-service:5000
+      - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
+      - RECOVERY_SCAN_INTERVAL_SECONDS=${RECOVERY_SCAN_INTERVAL_SECONDS:-5}
+      - WORKFLOW_LOCK_SECONDS=${WORKFLOW_LOCK_SECONDS:-120}
+      - REDIS_QUEUE_WORKERS=${ORCHESTRATOR_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
+      - ORDER_REDIS_HOST=order-db
+      - ORDER_REDIS_PORT=6379
+      - ORDER_REDIS_PASSWORD=redis
+      - ORDER_REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+    env_file:
+      - env/orchestrator_redis.env
+    depends_on:
+      - orchestrator-db
+      - order-db
+      - stock-service
+      - payment-service
+
+  orchestrator-db:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - orchestrator-db-data:/data
 
 volumes:
   order-db-data:
   stock-db-data:
   payment-db-data:
+  orchestrator-db-data:
