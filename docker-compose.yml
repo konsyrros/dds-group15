@@ -3,6 +3,11 @@ services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -22,11 +27,15 @@ services:
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
       - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 -k gevent --worker-connections 100 --timeout 120 --log-level=info app:app
+    sysctls:
+      net.core.somaxconn: 1024
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+    # deploy:
+    #   replicas: 4
 
   order-db:
     image: redis:7.2-bookworm
@@ -40,11 +49,15 @@ services:
     environment:
       - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k gevent --worker-connections 50 --timeout 120 --log-level=info app:app
+    sysctls:
+      net.core.somaxconn: 1024
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+    # deploy:
+    #   replicas: 2
 
   stock-db:
     image: redis:7.2-bookworm
@@ -58,11 +71,15 @@ services:
     environment:
       - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-120}
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 120 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k gevent --worker-connections 50 --timeout 120 --log-level=info app:app
+    sysctls:
+      net.core.somaxconn: 1024
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    # deploy:
+    #   replicas: 2
 
   payment-db:
     image: redis:7.2-bookworm
