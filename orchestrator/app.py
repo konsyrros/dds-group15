@@ -10,6 +10,7 @@ import redis
 import requests
 from flask import Flask, Response, abort, jsonify
 from msgspec import Struct, msgpack
+from werkzeug.exceptions import HTTPException
 
 from common.redis_queue import RedisCommandQueue, queued_json
 
@@ -33,9 +34,13 @@ STEP_ROLLED_BACK = "rolled_back"
 RECOVERY_SCAN_INTERVAL_SECONDS = float(os.getenv("RECOVERY_SCAN_INTERVAL_SECONDS", "5"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 WORKFLOW_LOCK_SECONDS = int(os.getenv("WORKFLOW_LOCK_SECONDS", "120"))
+RECOVERY_LEADER_LOCK_SECONDS = int(
+    os.getenv("RECOVERY_LEADER_LOCK_SECONDS", str(max(5, int(RECOVERY_SCAN_INTERVAL_SECONDS * 2))))
+)
 STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "http://stock-service:5000")
 PAYMENT_SERVICE_URL = os.environ.get("PAYMENT_SERVICE_URL", "http://payment-service:5000")
 TX_MODE = os.getenv("TX_MODE", MODE_SAGA).upper()
+RECOVERY_LEADER_KEY = "orchestrator:recovery:leader"
 
 if TX_MODE not in (MODE_SAGA, MODE_2PC):
     raise ValueError(f"Invalid TX_MODE={TX_MODE}. Use SAGA or 2PC.")
@@ -112,6 +117,10 @@ def workflow_lock_key(workflow_id: str) -> str:
 
 def active_order_workflow_key(order_id: str) -> str:
     return f"orchestrator:order:{order_id}"
+
+
+def recovery_leader_token() -> str:
+    return f"{os.getpid()}:{threading.current_thread().name}"
 
 
 def stock_tx_id(workflow_id: str, item_id: str) -> str:
@@ -461,8 +470,18 @@ command_queue = RedisCommandQueue(
 
 
 def recover_unfinished_workflows():
+    leader_token = recovery_leader_token()
     while True:
         try:
+            acquired = db.set(RECOVERY_LEADER_KEY, leader_token, nx=True, ex=RECOVERY_LEADER_LOCK_SECONDS)
+            if not acquired:
+                current_leader = db.get(RECOVERY_LEADER_KEY)
+                if current_leader == leader_token.encode():
+                    db.expire(RECOVERY_LEADER_KEY, RECOVERY_LEADER_LOCK_SECONDS)
+                else:
+                    time.sleep(RECOVERY_SCAN_INTERVAL_SECONDS)
+                    continue
+
             for key in db.scan_iter("orchestrator:workflow:*"):
                 raw = db.get(key)
                 if not raw:
@@ -472,6 +491,15 @@ def recover_unfinished_workflows():
                     continue
                 try:
                     run_workflow_by_id(workflow.workflow_id)
+                except HTTPException as exc:
+                    if exc.code == 409 and "already in progress" in exc.description:
+                        continue
+                    app.logger.warning(
+                        "Recovery retry for workflow %s failed: %s %s",
+                        workflow.workflow_id,
+                        exc.code,
+                        exc.description,
+                    )
                 except Exception as exc:
                     app.logger.warning(
                         "Recovery retry for workflow %s failed: %s",
