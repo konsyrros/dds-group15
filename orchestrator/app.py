@@ -37,6 +37,9 @@ WORKFLOW_LOCK_SECONDS = int(os.getenv("WORKFLOW_LOCK_SECONDS", "120"))
 RECOVERY_LEADER_LOCK_SECONDS = int(
     os.getenv("RECOVERY_LEADER_LOCK_SECONDS", str(max(5, int(RECOVERY_SCAN_INTERVAL_SECONDS * 2))))
 )
+RECOVERY_STALE_AFTER_SECONDS = float(
+    os.getenv("RECOVERY_STALE_AFTER_SECONDS", str(max(10, int(REQUEST_TIMEOUT_SECONDS * 2))))
+)
 STOCK_SERVICE_URL = os.environ.get("STOCK_SERVICE_URL", "http://stock-service:5000")
 PAYMENT_SERVICE_URL = os.environ.get("PAYMENT_SERVICE_URL", "http://payment-service:5000")
 TX_MODE = os.getenv("TX_MODE", MODE_SAGA).upper()
@@ -105,6 +108,8 @@ class CheckoutWorkflow(Struct):
     payment_state: str
     order_finalized: bool = False
     error: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
 
 def workflow_key(workflow_id: str) -> str:
@@ -121,6 +126,10 @@ def active_order_workflow_key(order_id: str) -> str:
 
 def recovery_leader_token() -> str:
     return f"{os.getpid()}:{threading.current_thread().name}"
+
+
+def now_seconds() -> float:
+    return time.time()
 
 
 def stock_tx_id(workflow_id: str, item_id: str) -> str:
@@ -140,6 +149,9 @@ def load_workflow(workflow_id: str) -> CheckoutWorkflow | None:
 
 
 def save_workflow(workflow: CheckoutWorkflow):
+    if workflow.created_at <= 0:
+        workflow.created_at = now_seconds()
+    workflow.updated_at = now_seconds()
     try:
         db.set(workflow_key(workflow.workflow_id), msgpack.encode(workflow))
     except redis.exceptions.RedisError:
@@ -211,6 +223,7 @@ def initialize_workflow(order_id: str) -> CheckoutWorkflow:
     if order_entry.paid:
         abort(409, "Order already paid")
     items = aggregate_items(order_entry.items)
+    timestamp = now_seconds()
     return CheckoutWorkflow(
         workflow_id=str(uuid.uuid4()),
         order_id=order_id,
@@ -220,8 +233,17 @@ def initialize_workflow(order_id: str) -> CheckoutWorkflow:
         total_cost=order_entry.total_cost,
         items=items,
         stock_states={item_id: STEP_PENDING for item_id, _ in items},
-        payment_state=STEP_PENDING
+        payment_state=STEP_PENDING,
+        created_at=timestamp,
+        updated_at=timestamp,
     )
+
+
+def workflow_is_stale(workflow: CheckoutWorkflow) -> bool:
+    last_update = workflow.updated_at or workflow.created_at
+    if last_update <= 0:
+        return True
+    return (now_seconds() - last_update) >= RECOVERY_STALE_AFTER_SECONDS
 
 
 def build_terminal_response(workflow: CheckoutWorkflow) -> dict[str, object]:
@@ -488,6 +510,8 @@ def recover_unfinished_workflows():
                     continue
                 workflow = msgpack.decode(raw, type=CheckoutWorkflow)
                 if is_terminal_state(workflow.state):
+                    continue
+                if not workflow_is_stale(workflow):
                     continue
                 try:
                     run_workflow_by_id(workflow.workflow_id)
