@@ -101,12 +101,86 @@ def recover_incomplete_2pc():
             if not raw:
                 continue
             log = msgpack.decode(raw, type=TxLog)
-            if log.phase not in ("COMMITTED", "ABORTED"):
-                app.logger.warning(
-                    f"[2PC] In-doubt tx_id={log.tx_id} order_id={log.order_id} "
-                    f"phase={log.phase} stock_votes={log.stock_votes} "
-                    f"payment={log.payment_vote}"
-                )
+
+            if log.phase in ("COMMITTED", "ABORTED"):
+                continue
+
+            app.logger.warning(
+                f"[2PC] In-doubt tx_id={log.tx_id} order_id={log.order_id} "
+                f"phase={log.phase} stock_votes={log.stock_votes} "
+                f"payment={log.payment_vote}"
+            )
+
+            # Stuck in PREPARING
+            if log.phase == "PREPARING":
+                log.phase = "ABORTING"
+                wal_write(log)
+
+                for item_id, vote in log.stock_votes.items():
+                    if vote == "YES":
+                        send_post_request(
+                            f"{GATEWAY_URL}/stock/transaction/cancel/{item_tx_id(log.tx_id, item_id)}"
+                        )
+
+                if log.payment_vote == "YES":
+                    send_post_request(f"{GATEWAY_URL}/payment/2pc/abort/{log.tx_id}")
+
+                log.phase = "ABORTED"
+                wal_write(log)
+                app.logger.info(f"[2PC-RECOVERY] Aborted incomplete PREPARING tx_id={log.tx_id}")
+                continue
+
+            # Stuck in PREPARED
+            if log.phase == "PREPARED":
+                log.phase = "ABORTING"
+                wal_write(log)
+
+                for item_id, vote in log.stock_votes.items():
+                    if vote == "YES":
+                        send_post_request(
+                            f"{GATEWAY_URL}/stock/transaction/cancel/{item_tx_id(log.tx_id, item_id)}"
+                        )
+
+                if log.payment_vote == "YES":
+                    send_post_request(f"{GATEWAY_URL}/payment/2pc/abort/{log.tx_id}")
+
+                log.phase = "ABORTED"
+                wal_write(log)
+                app.logger.info(f"[2PC-RECOVERY] Conservatively aborted PREPARED tx_id={log.tx_id}")
+                continue
+
+            # Stuck in ABORTING
+            if log.phase == "ABORTING":
+                for item_id, vote in log.stock_votes.items():
+                    if vote == "YES":
+                        send_post_request(
+                            f"{GATEWAY_URL}/stock/transaction/cancel/{item_tx_id(log.tx_id, item_id)}"
+                        )
+
+                if log.payment_vote == "YES":
+                    send_post_request(f"{GATEWAY_URL}/payment/2pc/abort/{log.tx_id}")
+
+                log.phase = "ABORTED"
+                wal_write(log)
+                app.logger.info(f"[2PC-RECOVERY] Completed abort for tx_id={log.tx_id}")
+                continue
+
+            # Stuck in COMMITTING
+            if log.phase == "COMMITTING":
+                for item_id, vote in log.stock_votes.items():
+                    if vote == "YES":
+                        send_post_request(
+                            f"{GATEWAY_URL}/stock/transaction/commit/{item_tx_id(log.tx_id, item_id)}"
+                        )
+
+                if log.payment_vote == "YES":
+                    send_post_request(f"{GATEWAY_URL}/payment/2pc/commit/{log.tx_id}")
+
+                log.phase = "COMMITTED"
+                wal_write(log)
+                app.logger.info(f"[2PC-RECOVERY] Completed commit for tx_id={log.tx_id}")
+                continue
+
     except redis.exceptions.RedisError:
         app.logger.error("[2PC] Failed to scan WAL records during startup")
 
