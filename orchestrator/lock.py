@@ -1,14 +1,3 @@
-"""
-orchestrator/lock.py
-====================
-Lightweight distributed lock backed by Redis.
-
-Uses the standard SET NX EX pattern for acquisition and a Lua
-script for safe release (only deletes the key if the token matches,
-so a lock whose TTL expired before we released it cannot accidentally
-release a lock held by a different caller).
-"""
-
 from __future__ import annotations
 
 import logging
@@ -34,16 +23,7 @@ def _lock_key(workflow_id: str) -> str:
 
 
 def acquire(db: redis.Redis, workflow_id: str, ttl_seconds: int) -> str | None:
-    """
-    Try to acquire the lock for *workflow_id*.
-
-    Returns a non-empty token string on success (keep it to release later).
-    Returns None if the lock is already held by another caller.
-
-    The lock auto-expires after *ttl_seconds* so a crashed process
-    cannot hold it forever.  Set ttl_seconds to comfortably exceed
-    your longest expected workflow duration.
-    """
+    """ Acquire lock for the given workflow. """
     token = uuid.uuid4().hex
     acquired = db.set(_lock_key(workflow_id), token, nx=True, ex=ttl_seconds)
     if acquired:
@@ -55,12 +35,7 @@ def acquire(db: redis.Redis, workflow_id: str, ttl_seconds: int) -> str | None:
 
 
 def release(db: redis.Redis, workflow_id: str, token: str) -> bool:
-    """
-    Release the lock for *workflow_id* only if we still own it.
-
-    Returns True if the lock was released, False if it had already
-    expired or been claimed by another caller (both safe outcomes).
-    """
+    """ Release lock for the given workflow based on the token. """
     result = db.eval(_RELEASE_SCRIPT, 1, _lock_key(workflow_id), token)
     released = bool(result)
     if released:

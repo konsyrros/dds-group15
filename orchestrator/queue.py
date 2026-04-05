@@ -1,10 +1,3 @@
-"""
-orchestrator/queue.py
-=====================
-Shared Redis-backed command queue utilities for services that want to
-serialize mutating operations through worker threads.
-"""
-
 from __future__ import annotations
 
 import atexit

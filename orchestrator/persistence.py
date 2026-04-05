@@ -1,10 +1,3 @@
-"""
-orchestrator/persistence.py
-===========================
-All Redis I/O for workflow records.
-No business logic, no HTTP, no domain knowledge.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,10 +15,7 @@ def _workflow_key(workflow_id: str) -> str:
 
 
 def save_workflow(db: redis.Redis, record: WorkflowRecord) -> None:
-    """
-    Persist a WorkflowRecord to Redis.
-    Raises redis.exceptions.RedisError on failure — caller decides how to handle.
-    """
+    """ Save workflow to Redis. """
     key = _workflow_key(record.workflow_id)
     value = msgpack.encode(record)
     db.set(key, value)
@@ -33,11 +23,7 @@ def save_workflow(db: redis.Redis, record: WorkflowRecord) -> None:
 
 
 def load_workflow(db: redis.Redis, workflow_id: str) -> WorkflowRecord | None:
-    """
-    Load a WorkflowRecord from Redis.
-    Returns None if the key does not exist.
-    Raises redis.exceptions.RedisError on I/O failure.
-    """
+    """ Load workflow record from Redis. """
     raw = db.get(_workflow_key(workflow_id))
     if raw is None:
         return None
@@ -47,10 +33,7 @@ def load_workflow(db: redis.Redis, workflow_id: str) -> WorkflowRecord | None:
 
 
 def list_active_workflows(db: redis.Redis) -> list[WorkflowRecord]:
-    """
-    Scan all orchestrator:workflow:* keys and return records that are
-    not yet in a terminal state. Used by the recovery thread.
-    """
+    """ Search workflows not in terminal sate, used by recovery procedure. """
     from .models import TERMINAL_STATES  # local import avoids circular
 
     active = []
@@ -68,8 +51,6 @@ def list_active_workflows(db: redis.Redis) -> list[WorkflowRecord]:
 
 
 def prune_workflow(db: redis.Redis, workflow_id: str) -> None:
-    """
-    Delete a completed workflow record from Redis.
-    """
+    """ Delete a completed workflow record from Redis. """
     db.delete(_workflow_key(workflow_id))
     logger.debug("[persistence] pruned workflow_id=%s", workflow_id)

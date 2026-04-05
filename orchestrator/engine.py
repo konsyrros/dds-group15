@@ -1,18 +1,3 @@
-"""
-orchestrator/engine.py
-=======================
-WorkflowEngine — the only class callers need.
-
-The engine is completely agnostic about what the steps do.
-It only knows:
-  - Execute steps in order.
-  - If a step raises StepFailed → roll back completed steps in reverse.
-  - In 2PC: first run all execute() (prepare/vote), then run all commit().
-  - Persist state after every individual step so a crash always leaves
-    a recoverable snapshot.
-  - On resume after a crash: skip steps that are already done.
-"""
-
 from __future__ import annotations
 
 import json
@@ -47,45 +32,11 @@ logger = logging.getLogger(__name__)
 MODE_SAGA = "SAGA"
 MODE_2PC  = "2PC"
 
-# How long the distributed lock is held while driving a workflow.
-# If the process dies the lock auto-expires and the recovery thread
-# can re-acquire it.
+# Maximum lock duration
 DEFAULT_LOCK_TTL_SECONDS = 120
 
 
 class WorkflowEngine:
-    """
-    Generic distributed-transaction executor.
-
-    Parameters
-    ----------
-    db:
-        A connected redis.Redis client.  The engine uses it for
-        workflow persistence and distributed locking.
-
-    steps:
-        Ordered list of Step objects defined by the caller.
-        The order is significant: steps execute left-to-right and
-        roll back right-to-left.
-
-    mode:
-        "SAGA" or "2PC" (case-insensitive).
-
-    lock_ttl_seconds:
-        How long (in seconds) the distributed lock is held while a
-        workflow is being driven.  Should be larger than the expected
-        wall-clock time of the longest workflow.
-
-    Example
-    -------
-    ::
-
-        engine = WorkflowEngine(db, steps=[step_stock, step_payment], mode="SAGA")
-        record = engine.start("wf-abc123", context={"user_id": "u1", ...})
-        if record.state == STATE_COMPLETED:
-            mark_order_paid(order_id)
-    """
-
     def __init__(
         self,
         db:               redis.Redis,
@@ -112,21 +63,9 @@ class WorkflowEngine:
         self._lock_ttl = lock_ttl_seconds
         self._step_map = {s.name: s for s in steps}
 
-    # ─────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────
 
     def start(self, workflow_id: str, context: Context) -> WorkflowRecord:
-        """
-        Create and immediately drive a new workflow.
-
-        If a record with *workflow_id* already exists (idempotent
-        restart / duplicate request) the existing record is resumed
-        instead of creating a duplicate.
-
-        Returns the final WorkflowRecord (always in a terminal state
-        unless an unexpected exception escapes from a Step callable).
-        """
+        """ Start (or idempotently continue) a workflow with the given ID and context. """
         existing = load_workflow(self._db, workflow_id)
         if existing is not None:
             logger.info("[engine] workflow_id=%s already exists — resuming", workflow_id)
@@ -146,13 +85,7 @@ class WorkflowEngine:
         return self._drive(record)
 
     def resume(self, workflow_id: str) -> WorkflowRecord:
-        """
-        Re-drive a non-terminal workflow.
-
-        Called by the recovery thread and by any explicit /resume
-        endpoint.  Safe to call on a terminal workflow (returns
-        immediately without doing anything).
-        """
+        """ Continue an existing workflow not yet completed, used by recovery flow. """
         record = load_workflow(self._db, workflow_id)
         if record is None:
             raise KeyError(f"Workflow not found: {workflow_id}")
@@ -166,30 +99,18 @@ class WorkflowEngine:
     def get(self, workflow_id: str) -> WorkflowRecord | None:
         """Return the current WorkflowRecord without driving it."""
         return load_workflow(self._db, workflow_id)
-
-    # ─────────────────────────────────────────────────────────────
-    # Internal driver — acquires lock then dispatches to SAGA / 2PC
-    # ─────────────────────────────────────────────────────────────
+    
 
     def _drive(self, record: WorkflowRecord) -> WorkflowRecord:
-        """
-        Acquire the distributed lock for this workflow, drive it to a
-        terminal state, then release the lock.
-
-        If the lock is already held (another process is driving this
-        workflow concurrently) we reload and return the current state
-        without blocking — the other process will finish eventually
-        and the recovery thread will pick it up if it crashes.
-        """
+        """ Acquires lock for the resources, runs the workflow with the appropriate protocol, and releases the lock. """
         token = lock_module.acquire(self._db, record.workflow_id, self._lock_ttl)
         if token is None:
-            # Another process is driving — reload current state and return.
+            # Another process is blocking the resources, return the current state.
             fresh = load_workflow(self._db, record.workflow_id)
             return fresh if fresh is not None else record
 
         try:
-            # Reload after acquiring the lock — state may have changed
-            # between our load and the lock acquisition.
+            # Refresh the record
             record = load_workflow(self._db, record.workflow_id)
             if record is None or record.state in TERMINAL_STATES:
                 return record
@@ -200,8 +121,7 @@ class WorkflowEngine:
                 return self._drive_2pc(record)
 
         except StepFailed:
-            # StepFailed should always be caught inside _drive_saga / _drive_2pc.
-            # If it bubbles up here something went wrong in the rollback itself.
+            # StepFailed should always be caught inside protocol drivers
             logger.exception("[engine] unexpected StepFailed outside driver  workflow_id=%s",
                              record.workflow_id)
             record.state = STATE_FAILED
@@ -219,21 +139,8 @@ class WorkflowEngine:
         finally:
             lock_module.release(self._db, record.workflow_id, token)
 
-    # ─────────────────────────────────────────────────────────────
-    # SAGA driver
-    # ─────────────────────────────────────────────────────────────
 
     def _drive_saga(self, record: WorkflowRecord) -> WorkflowRecord:
-        """
-        Execute all steps sequentially.
-        On first failure: roll back all completed steps in reverse order.
-
-        SAGA has no separate commit phase — each execute() permanently
-        commits its local transaction immediately.
-
-        Crash-safe: we persist after every step.  On resume, steps
-        already in STEP_EXECUTED are skipped.
-        """
         logger.info("[engine][SAGA] starting  workflow_id=%s", record.workflow_id)
         record.state = STATE_PREPARING
         save_workflow(self._db, record)
@@ -274,28 +181,14 @@ class WorkflowEngine:
         save_workflow(self._db, record)
         logger.info("[engine][SAGA] completed  workflow_id=%s", record.workflow_id)
         return record
-
-    # ─────────────────────────────────────────────────────────────
-    # 2PC driver
-    # ─────────────────────────────────────────────────────────────
+    
 
     def _drive_2pc(self, record: WorkflowRecord) -> WorkflowRecord:
-        """
-        Phase 1 — PREPARE: run execute() on every step.
-                  Any failure → abort all prepared steps.
-        Phase 2 — COMMIT:  run commit() on every prepared step.
-                  Commit failures abort the affected step and fail
-                  the workflow (commit should rarely fail if prepare
-                  was correctly implemented).
-
-        Crash-safe: persisted after every individual step.
-        On resume: skips steps already in STEP_EXECUTED or STEP_COMMITTED.
-        """
         logger.info("[engine][2PC] starting  workflow_id=%s", record.workflow_id)
 
         ctx = self._load_context(record)
 
-        # ── Phase 1: PREPARE ──────────────────────────────────────
+        # PREPARE phase
         if record.state not in (STATE_COMMITTING,):
             record.state = STATE_PREPARING
             save_workflow(self._db, record)
@@ -332,7 +225,7 @@ class WorkflowEngine:
             record.state = STATE_COMMITTING
             save_workflow(self._db, record)
 
-        # ── Phase 2: COMMIT ───────────────────────────────────────
+        # COMMIT phase
         logger.info("[engine][2PC] committing  workflow_id=%s", record.workflow_id)
 
         for step in self._steps:
@@ -349,7 +242,7 @@ class WorkflowEngine:
             logger.info("[engine][2PC] commit  step=%s  workflow_id=%s",
                         step.name, record.workflow_id)
             try:
-                step.commit(ctx)   # type: ignore[misc]  — guaranteed non-None in 2PC mode
+                step.commit(ctx)   # type: ignore[misc] - guaranteed non-None in 2PC mode
                 self._save_context(record, ctx)
                 record.step_states[step.name] = STEP_COMMITTED
                 save_workflow(self._db, record)
@@ -370,10 +263,7 @@ class WorkflowEngine:
         save_workflow(self._db, record)
         logger.info("[engine][2PC] completed  workflow_id=%s", record.workflow_id)
         return record
-
-    # ─────────────────────────────────────────────────────────────
-    # Shared rollback
-    # ─────────────────────────────────────────────────────────────
+    
 
     def _rollback(
         self,
@@ -382,15 +272,7 @@ class WorkflowEngine:
         completed: list[Step],
         reason:    str,
     ) -> WorkflowRecord:
-        """
-        Call rollback() on every completed step in reverse order.
-        Persists state after each rollback so a crash mid-rollback
-        is safely resumable.
-
-        If a rollback callable itself raises, we log the error and
-        continue with the remaining rollbacks (best-effort) rather
-        than leaving other resources locked indefinitely.
-        """
+        """ Roll back all completed steps in reverse order. """
         logger.warning("[engine] rolling back  workflow_id=%s  reason=%s",
                        record.workflow_id, reason)
         record.state = STATE_ROLLING_BACK
@@ -423,10 +305,8 @@ class WorkflowEngine:
         logger.info("[engine] rolled back  workflow_id=%s", record.workflow_id)
         return record
 
-    # ─────────────────────────────────────────────────────────────
-    # Context serialisation helpers
-    # ─────────────────────────────────────────────────────────────
 
+    # Serialization utilities
     @staticmethod
     def _load_context(record: WorkflowRecord) -> Context:
         return json.loads(record.context_json)

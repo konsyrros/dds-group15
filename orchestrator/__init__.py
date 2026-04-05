@@ -1,21 +1,3 @@
-"""
-orchestrator
-============
-A generic, Redis-backed distributed-transaction executor.
-
-Public API
-----------
-::
-
-    from orchestrator import WorkflowEngine, Step, StepFailed
-    from orchestrator import (
-        STATE_COMPLETED, STATE_ROLLED_BACK, STATE_FAILED,
-        start_recovery_thread,
-    )
-
-Everything else is considered internal.
-"""
-
 from .engine   import WorkflowEngine          # noqa: F401
 from .models   import (                       # noqa: F401
     Step,
