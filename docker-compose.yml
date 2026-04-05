@@ -13,11 +13,13 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - TX_MODE=SAGA
+      - TX_MODE=2PC
       - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
       - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
@@ -35,7 +37,9 @@ services:
       - order-db-data:/data
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     environment:
       - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
@@ -53,7 +57,9 @@ services:
       - stock-db-data:/data
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
     environment:
       - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
