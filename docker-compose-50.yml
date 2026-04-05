@@ -34,7 +34,7 @@ services:
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 4
+      -w 9
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -49,18 +49,27 @@ services:
       - env/order_redis.env
     depends_on:
       - order-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '10'
 
   order-db:
     image: redis:7.2-bookworm
     command: >
       redis-server
       --requirepass redis
-      --maxmemory 512mb
+      --maxmemory 1gb
       --maxmemory-policy noeviction
       --appendonly yes
       --appendfsync everysec
     volumes:
       - order-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
 
   stock-service:
     build: ./stock
@@ -70,7 +79,7 @@ services:
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 2
+      -w 6
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -85,6 +94,11 @@ services:
       - env/stock_redis.env
     depends_on:
       - stock-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '7'
 
   stock-db:
     image: redis:7.2-bookworm
@@ -97,6 +111,10 @@ services:
       --appendfsync everysec
     volumes:
       - stock-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
 
   payment-service:
     build: ./payment
@@ -106,7 +124,7 @@ services:
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 2
+      -w 4
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -121,6 +139,11 @@ services:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '5'
 
   payment-db:
     image: redis:7.2-bookworm
@@ -133,6 +156,10 @@ services:
       --appendfsync everysec
     volumes:
       - payment-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
 
 volumes:
   order-db-data:

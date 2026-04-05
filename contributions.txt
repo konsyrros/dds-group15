@@ -1,0 +1,9 @@
+Konstantinos Syrros (5695112, K.Syrros-1@student.tudelft.nl): I worked on the Order Service, the 2PC and WAL implementations and recovery mechanisms of phase 1, and planned and worked on the Orchestrator for phase 2. I also tested the system and created the scalability configurations.
+
+Marco Trapasso (5767202, M.Trapasso-1@student.tudelft.nl): I worked on the Stock Service, worked on making the Orchestrator and worked on implementing Redis Queue for phase 2. 
+
+Claudia Montalvo (): I worked on the Order Service, worked on SAGA and implemented SAGA Recovery.
+
+Norah Elisabeth Milanesi (6418074, Nmilanesi@tudelft.nl): I worked on the Stock Service, worked on making the Orchestrator and created the vanilla and orchestrator-lib branches.
+
+Ayush Khadka (5678021, A.Khadka-1@student.tudelft.nl): I worked on the Payment Service, implemented the 2PC and SAGA, implemented WAL and implemented Redis Queue for the payment service.
