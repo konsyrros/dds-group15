@@ -35,6 +35,7 @@ from .models   import (                       # noqa: F401
     STEP_ROLLEDBACK,
 )
 from .recovery import start_recovery_thread   # noqa: F401
+from .queue import RedisCommandQueue, queued_json, queued_text  # noqa: F401
 
 __all__ = [
     "WorkflowEngine",
@@ -42,6 +43,9 @@ __all__ = [
     "StepFailed",
     "WorkflowRecord",
     "start_recovery_thread",
+    "RedisCommandQueue",
+    "queued_json",
+    "queued_text",
     # state constants
     "STATE_COMPLETED",
     "STATE_ROLLED_BACK",

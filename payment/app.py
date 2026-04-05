@@ -8,7 +8,7 @@ import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-from redis_queue import RedisCommandQueue, queued_json, queued_text
+from orchestrator import RedisCommandQueue, queued_json, queued_text
 
 # curl.exe -s -X POST http://localhost:8000/payment/create_user
 # curl.exe -s -X POST http://localhost:8000/payment/add_funds/<NEW_USER_ID>/100

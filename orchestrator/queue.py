@@ -1,3 +1,12 @@
+"""
+orchestrator/queue.py
+=====================
+Shared Redis-backed command queue utilities for services that want to
+serialize mutating operations through worker threads.
+"""
+
+from __future__ import annotations
+
 import atexit
 import json
 import logging
@@ -9,7 +18,6 @@ from collections.abc import Callable
 from typing import Any
 
 import redis
-from werkzeug.exceptions import HTTPException
 
 
 QUEUE_RESULT_TIMEOUT_SECONDS = int(os.getenv("REDIS_QUEUE_RESULT_TIMEOUT_SECONDS", "120"))
@@ -33,7 +41,7 @@ class RedisCommandQueue:
         name: str,
         redis_factory: Callable[[], redis.Redis],
         handlers: dict[str, Callable[..., dict[str, Any]]],
-        logger: logging.Logger
+        logger: logging.Logger,
     ):
         self.name = name
         self.redis_factory = redis_factory
@@ -50,14 +58,14 @@ class RedisCommandQueue:
                 target=self._worker_loop,
                 args=(worker_client,),
                 name=f"{name}-queue-{index}",
-                daemon=True
+                daemon=True,
             )
             thread.start()
             self.worker_clients.append(worker_client)
             self.worker_threads.append(thread)
         atexit.register(self.close)
 
-    def close(self):
+    def close(self) -> None:
         self.submit_client.close()
         for worker_client in self.worker_clients:
             worker_client.close()
@@ -67,7 +75,7 @@ class RedisCommandQueue:
         command = {
             "operation": operation,
             "payload": payload,
-            "result_key": result_key
+            "result_key": result_key,
         }
         try:
             self.submit_client.rpush(self.queue_key, json.dumps(command))
@@ -79,7 +87,7 @@ class RedisCommandQueue:
         _, raw_result = result
         return json.loads(raw_result)
 
-    def _worker_loop(self, worker_client: redis.Redis):
+    def _worker_loop(self, worker_client: redis.Redis) -> None:
         while True:
             try:
                 queued_entry = worker_client.blpop(self.queue_key, timeout=QUEUE_BLOCK_TIMEOUT_SECONDS)
@@ -104,8 +112,10 @@ class RedisCommandQueue:
         try:
             response = handler(**payload)
             return {"ok": True, "response": response}
-        except HTTPException as exc:
-            return {"ok": False, "status": exc.code or 500, "body": exc.description}
-        except Exception:
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            description = getattr(exc, "description", None)
+            if isinstance(code, int) and isinstance(description, str):
+                return {"ok": False, "status": code, "body": description}
             self.logger.exception("Unhandled error in queued operation %s", operation)
             return {"ok": False, "status": 500, "body": "Internal server error"}
