@@ -23,16 +23,104 @@ services:
           cpus: '2'
 
   order-service:
-    build:
-      context: .
-      dockerfile: order/Dockerfile
+    build: ./order
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - TX_MODE=2PC
+      - TX_MODE=SAGA
       - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
       - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
+    command: >
+      gunicorn -b 0.0.0.0:5000
+      -w 9
+      -k gevent
+      --worker-connections 1000
+      --timeout 30
+      --keep-alive 5
+      --max-requests 1000
+      --max-requests-jitter 100
+      --log-level=info
+      app:app
+    sysctls:
+      net.core.somaxconn: 65535
+    env_file:
+      - env/order_redis.env
+    depends_on:
+      - order-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '10'
+
+  order-db:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 1gb
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - order-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+
+  stock-service:
+    build: ./stock
+    image: stock:latest
+    environment:
+      - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
+    command: >
+      gunicorn -b 0.0.0.0:5000
+      -w 6
+      -k gevent
+      --worker-connections 1000
+      --timeout 30
+      --keep-alive 5
+      --max-requests 1000
+      --max-requests-jitter 100
+      --log-level=info
+      app:app
+    sysctls:
+      net.core.somaxconn: 65535
+    env_file:
+      - env/stock_redis.env
+    depends_on:
+      - stock-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '7'
+
+  stock-db:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --requirepass redis
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - stock-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+
+  payment-service:
+    build: ./payment
+    image: payment:latest
+    environment:
+      - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
@@ -48,85 +136,14 @@ services:
     sysctls:
       net.core.somaxconn: 65535
     env_file:
-      - env/order_redis.env
-    depends_on:
-      - order-db
-
-  order-db:
-    image: redis:7.2-bookworm
-    command: >
-      redis-server
-      --requirepass redis
-      --maxmemory 512mb
-      --maxmemory-policy noeviction
-      --appendonly yes
-      --appendfsync everysec
-    volumes:
-      - order-db-data:/data
-
-  stock-service:
-    build:
-      context: .
-      dockerfile: stock/Dockerfile
-    image: stock:latest
-    environment:
-      - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
-      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
-    command: >
-      gunicorn -b 0.0.0.0:5000
-      -w 2
-      -k gevent
-      --worker-connections 1000
-      --timeout 30
-      --keep-alive 5
-      --max-requests 1000
-      --max-requests-jitter 100
-      --log-level=info
-      app:app
-    sysctls:
-      net.core.somaxconn: 65535
-    env_file:
-      - env/stock_redis.env
-    depends_on:
-      - stock-db
-
-  stock-db:
-    image: redis:7.2-bookworm
-    command: >
-      redis-server
-      --requirepass redis
-      --maxmemory 512mb
-      --maxmemory-policy noeviction
-      --appendonly yes
-      --appendfsync everysec
-    volumes:
-      - stock-db-data:/data
-
-  payment-service:
-    build:
-      context: .
-      dockerfile: payment/Dockerfile
-    image: payment:latest
-    environment:
-      - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
-      - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
-    command: >
-      gunicorn -b 0.0.0.0:5000
-      -w 2
-      -k gevent
-      --worker-connections 1000
-      --timeout 30
-      --keep-alive 5
-      --max-requests 1000
-      --max-requests-jitter 100
-      --log-level=info
-      app:app
-    sysctls:
-      net.core.somaxconn: 65535
-    env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '5'
 
   payment-db:
     image: redis:7.2-bookworm
@@ -139,6 +156,10 @@ services:
       --appendfsync everysec
     volumes:
       - payment-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
 
 volumes:
   order-db-data:

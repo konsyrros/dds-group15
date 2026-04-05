@@ -20,23 +20,21 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: '4'
 
   order-service:
-    build:
-      context: .
-      dockerfile: order/Dockerfile
+    build: ./order
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - TX_MODE=2PC
+      - TX_MODE=SAGA
       - CHECKOUT_PROTOCOL=${CHECKOUT_PROTOCOL:-2pc}
       - REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-15}
-      - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_WORKERS=${ORDER_QUEUE_WORKERS:-12}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 4
+      -w 9
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -51,30 +49,37 @@ services:
       - env/order_redis.env
     depends_on:
       - order-db
+    deploy:
+      replicas: 4
+      resources:
+        limits:
+          cpus: '10'
 
   order-db:
     image: redis:7.2-bookworm
     command: >
       redis-server
       --requirepass redis
-      --maxmemory 512mb
+      --maxmemory 1gb
       --maxmemory-policy noeviction
       --appendonly yes
       --appendfsync everysec
     volumes:
       - order-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
 
   stock-service:
-    build:
-      context: .
-      dockerfile: stock/Dockerfile
+    build: ./stock
     image: stock:latest
     environment:
-      - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-8}
+      - REDIS_QUEUE_WORKERS=${STOCK_QUEUE_WORKERS:-10}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 2
+      -w 10
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -89,6 +94,11 @@ services:
       - env/stock_redis.env
     depends_on:
       - stock-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '12'
 
   stock-db:
     image: redis:7.2-bookworm
@@ -101,18 +111,20 @@ services:
       --appendfsync everysec
     volumes:
       - stock-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
 
   payment-service:
-    build:
-      context: .
-      dockerfile: payment/Dockerfile
+    build: ./payment
     image: payment:latest
     environment:
       - REDIS_QUEUE_WORKERS=${PAYMENT_QUEUE_WORKERS:-8}
       - REDIS_QUEUE_RESULT_TIMEOUT_SECONDS=${REDIS_QUEUE_RESULT_TIMEOUT_SECONDS:-30}
     command: >
       gunicorn -b 0.0.0.0:5000
-      -w 2
+      -w 8
       -k gevent
       --worker-connections 1000
       --timeout 30
@@ -127,6 +139,11 @@ services:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '9'
 
   payment-db:
     image: redis:7.2-bookworm
@@ -139,6 +156,10 @@ services:
       --appendfsync everysec
     volumes:
       - payment-db-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
 
 volumes:
   order-db-data:
