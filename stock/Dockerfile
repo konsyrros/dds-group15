@@ -2,10 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /home/flask-app
 
-COPY ./requirements.txt .
+COPY orchestrator /tmp/orchestrator
+COPY stock/requirements.txt /tmp/stock-requirements.txt
 
-RUN pip install -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-build-isolation /tmp/orchestrator \
+    && python -m pip install -r /tmp/stock-requirements.txt
 
-COPY . .
+COPY stock /home/flask-app
 
 EXPOSE 5000

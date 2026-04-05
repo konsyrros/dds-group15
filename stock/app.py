@@ -8,7 +8,7 @@ import redis
 from flask import Flask, Response, abort, jsonify
 from msgspec import Struct, msgpack
 
-from redis_queue import RedisCommandQueue, queued_json, queued_text
+from orchestrator import RedisCommandQueue, queued_json, queued_text
 
 
 DB_ERROR_STR = "DB error"
